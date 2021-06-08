@@ -1,0 +1,573 @@
+---
+title: "sc-RNA synthetic data"
+author: "Vittorio Zampinetti"
+date: "May 5, 2021"
+output: 
+  ioslides_presentation:
+    widescreen: true
+    smaller: true
+    logo: /home/zemp/kth/thesis/R/img/kth_logo.svg
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE)
+```
+
+```{r lib, include=FALSE}
+library(tidyverse)
+library(scales)
+
+library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+library(org.Hs.eg.db)
+library(biomaRt)
+
+library(SingleCellExperiment)
+library(scran)
+library(scater)
+library(clonealign)
+library(ggpubr)
+library(viridis)
+```
+
+```{r functions, fig.width=8,fig.height=12}
+preprocess_c2n <- function(c2n.raw, recode = FALSE) {
+  c2n.raw <- c2n.raw %>%
+    dplyr::select(cell, clone = node)
+  # fix the values of the column for nodes assignment
+  if (recode) {
+    c2n.raw <- c2n.raw %>%
+      dplyr::mutate(clone = recode(clone,
+                                 '0_0' = 'ABCDEFGHI',
+                                 '0_0_0' = 'A',
+                                 '0_0_0_0' = 'D',
+                                 '0_0_0_0_0'= 'C',
+                                 '0_0_1' = 'EFGHI',
+                                 '0_0_0_1' = 'F'))
+  }
+  return(c2n.raw)
+}
+
+build_sce <- function(sc.mat, mart) {
+  sce.tot <- SingleCellExperiment(assays = list(counts = sc.mat))
+  
+  ensembl2pos <- getBM(attributes=c('ensembl_gene_id', 'chromosome_name', 'start_position', 'end_position'), 
+        filters = 'ensembl_gene_id', 
+        values = rownames(sce.tot), 
+        mart = mart)
+  keep <- rownames(sce.tot) %in% ensembl2pos$ensembl_gene_id
+  sce.tot <- sce.tot[keep,]
+  # map rownames to location coordinates
+  ensembl2pos.sorted <- left_join(tibble(ensembl_gene_id = rownames(sce.tot)), ensembl2pos)
+  # add location to metadata of sce
+  rowData(sce.tot)$chromosome_name <- factor(paste0('chr', ensembl2pos.sorted$chromosome_name), levels = chr.levels)
+  rowData(sce.tot)$start_position <- ensembl2pos.sorted$start_position
+  rowData(sce.tot)$end_position <- ensembl2pos.sorted$end_position
+  
+  return(sce.tot)
+}
+
+filter_sce <- function(sce, avg_count_thresh = 0.2, plot = FALSE) {
+  # keep only the expressed genes
+  avg.counts <- rowMeans(counts(sce))
+  keep <- avg.counts >= avg_count_thresh
+  sce <- sce[keep,]
+  
+  if (plot) {
+    p <- ggplot(as.data.frame(log(avg.counts))) +
+      geom_histogram(aes(log(avg.counts)), bins = 100) +
+      geom_vline(xintercept = log(avg_count_thresh), linetype = 'dashed', color = 'blue') +
+      labs(title = paste0("Filtering"), y = 'gene_count', x = 'Log(avg-expression)')
+    print(p)
+  }
+  
+  return(sce)
+}
+
+# estimate bin width (genomic resolution) following copykat
+# take the median neighboring genes distance and multiply it by the gene window
+compute_genomic_res <- function(sce, gene_window = 25) {
+  # helper dataframe
+  sce.meta <- tibble(
+    ensembl_id = rownames(sce),
+    chr = rowData(sce)$chromosome_name,
+    start = rowData(sce)$start_position,
+    end = rowData(sce)$end_position) %>%
+      dplyr::mutate(mid = (start + end) / 2) %>%
+      dplyr::arrange(chr, mid)
+  
+  # TODO check if M or MT
+  p <- sce.meta %>%
+    dplyr::mutate(chr.n = factor(str_remove(chr, 'chr'), levels = c(1:22, c('X', 'Y', 'M')))) %>%
+    ggplot(aes(x = chr.n)) +
+      geom_bar(fill = 'deepskyblue4') +
+      labs(title = "Genes per chromosome", y = 'num_gene', x = 'chromosome')
+  print(p)
+  
+  dist <- sce.meta %>%
+    dplyr::group_by(chr) %>%
+    dplyr::mutate(dist = mid - lag(mid, default = 0)) %>%
+    dplyr::ungroup() %>%
+    dplyr::pull(dist)
+
+  gen_res <- median(dist) * gene_window
+  
+  return(gen_res)
+}
+
+# function for binning of single cell experiment
+bin_sce_data <- function(sce, bin_size) {
+  sce.meta <- tibble(
+    ensembl_id = rownames(sce),
+    chr = rowData(sce)$chromosome_name,
+    start = rowData(sce)$start_position,
+    end = rowData(sce)$end_position) %>%
+      dplyr::mutate(mid = (start + end) / 2) %>%
+      dplyr::arrange(chr, mid)
+  
+  # sce.meta and counts are both sorted by gene position
+  sce.df <- bind_cols(sce.meta, as_tibble(counts(sce)))
+  
+  bin_sce <- sce.df %>%
+    dplyr::arrange(chr, end) %>%
+    dplyr::group_by(chr) %>%
+    dplyr::mutate(bin = floor(end / bin_size)) %>%
+    dplyr::group_by(chr, bin) %>%
+    dplyr::summarise(dplyr::across(matches('c\\d+'), sum))
+    
+  return(bin_sce)
+}
+
+plot_chr_clone <- function(bin_sce, cn, c2n, chromosome, node, bin_size) {
+  # TODO maybe use lognormcounts instead of just counts
+  
+  bin_sce %>%
+    dplyr::filter(chr == chromosome) %>%
+    pivot_longer(cols = grep('c\\d+', colnames(bin_sce), value = TRUE), names_to = "cell", values_to = "count") %>%
+    left_join(c2n, by = "cell") %>%
+    dplyr::filter(clone == node, count > 0) %>%
+    dplyr::mutate(logcount = log(count), pos = bin * bin_size + bin_size/2) %>%
+    ggplot() +
+      geom_boxplot(mapping = aes(x = pos, y = logcount, color = 'log-expr', group = pos)) +
+      geom_linerange(data = dplyr::filter(cn, clone == node, chr == chromosome),
+                     mapping = aes(xmin = start, xmax = end, y = copy_number, color = 'copy-num')) +
+      scale_colour_manual("",
+                          values = c("log-expr"="black", "copy-num"="red")) +
+      labs(title = paste0("Expression/copy-number - ", chromosome), y = 'Log-count', x = 'Genomic position') +
+      scale_y_continuous(breaks = breaks_width(1))
+}
+# TODO fix legend symbols: https://stackoverflow.com/questions/26587940/ggplot2-different-legend-symbols-for-points-and-
+plot_genome_cn <- function(sce, cn, cln, ttl = NULL) {
+  sce.meta <- tibble(
+    ensembl_id = rownames(sce),
+    chr = rowData(sce)$chromosome_name,
+    start = rowData(sce)$start_position,
+    end = rowData(sce)$end_position) %>%
+      dplyr::mutate(mid = (start + end) / 2) %>%
+      dplyr::arrange(chr, mid)
+  
+  chr_end <- sce.meta %>%
+    dplyr::select(chr, end) %>%
+    dplyr::group_by(chr) %>%
+    dplyr::summarise(max = max(end)) %>%
+    drop_na() %>%
+    with(setNames(max, chr))
+  
+  end_pos <- 0
+  chr_offset <- setNames(rep(0, 24), chr.levels)
+  for (chr in chr.levels) {
+    chr_offset[chr] <- end_pos
+    end_pos <- end_pos + chr_end[chr]
+  }
+  
+  cn %>%
+    dplyr::filter(clone == cln) %>%
+    dplyr::mutate(chr_os = chr_offset[chr]) %>%
+    dplyr::mutate(start = start + chr_os, end = end + chr_os[chr]) %>%
+    ggplot() +
+      geom_jitter(mapping = aes(x = (start + end) / 2, y = copy_number, color = copy_number),
+                  size = 0.2, width = 0) +
+      scale_color_gradient(low = "yellow", high = "red") +
+      labs(title = ttl, y = 'CN', x = 'Genomic position') +
+      scale_x_continuous(breaks = chr_offset) +
+      theme(legend.position = "none",
+            axis.text.x = element_blank())
+}
+
+plot_breakpoint_lengths <- function(cn_data, xlim = c(0, Inf)) {
+  df <- data.frame(matrix(ncol = 2, nrow = 0))
+  for (c in base::unique(cn_data$clone)) {
+    len <- rle(dplyr::filter(cn_data, clone == c)$copy_number)$lengths
+    df <- rbind(df, cbind(rep(c, length(len)), len))
+    cat(c, " | mean: ", mean(len), ", var: ", var(len), ", count: ", length(len), "\n")
+  }
+  colnames(df) <- c("clone", "len")
+  df$len <- as.numeric(df$len)
+  p <- df %>%
+    dplyr::filter(len > xlim[1] & len < xlim[2]) %>%
+    ggplot(aes(x = len, y = (..count..)/sum(..count..), fill = clone)) +
+      geom_bar() +
+      stat_bin(binwidth = 5) +
+      labs(x = "breakpoint length",
+           y = "frequency",
+           title = "Breakpoints histogram")
+  return(p)
+}
+
+# Size factor
+plot_sf <- function(sce, bins = 30) {
+  
+  med <- median(colData(sce)$sizeFactor)
+  p_hist <- as.data.frame(colData(sce)) %>%
+    ggplot(aes(x = sizeFactor)) +
+      geom_histogram(bins = bins) +
+      geom_vline(xintercept = med, color = "blue") +
+      annotate(x = med, y = +Inf, label = "median", vjust = 2, geom = "label")
+      labs(x = "size factor",
+           y = "count")
+  # 
+  # eps <- 0.005
+  # p_zero <- as.data.frame(colData(sce)) %>%
+  #   dplyr::mutate(lte = sizeFactor < eps) %>%
+  #   ggplot(aes(x = lte)) +
+  #     geom_bar() +
+  #     labs(x = paste0("< eps (", eps, ")"),
+  #          y = "count")
+
+  # p <- ggarrange(p_hist, p_zero,
+  #                 labels = c("A", "B"),
+  #                 ncol = 2, nrow = 1)
+  
+  cat("mean: ", mean(colData(sce)$sizeFactor), 
+      ", var: ", var(colData(sce)$sizeFactor),
+      ", min: ", min(colData(sce)$sizeFactor),
+      ", max: ", max(colData(sce)$sizeFactor))
+
+  return(p_hist)
+}
+
+## links copy numbers to sc gene expression data (where clone matching is possible)
+add_cn_to_sce <- function(sce, cn, cell2node, ok_clones = NULL) {
+  
+  bin_size <- cn$end[1] - cn$start[1] + 1
+  
+  # assigns id to each bin
+  cn.bin <- cn %>%
+    dplyr::arrange(chr, start) %>%
+    dplyr::group_by(chr) %>%
+    dplyr::mutate(bin = floor(start / bin_size)) %>%
+    dplyr::ungroup()
+  
+  # helper dataframe
+  sce.meta <- tibble(
+    ensembl_id = rownames(sce),
+    chr = rowData(sce)$chromosome_name,
+    start = rowData(sce)$start_position,
+    end = rowData(sce)$end_position) %>%
+      dplyr::arrange(chr, start)
+   
+  # find the bin for the expression data
+  bin_sce <- sce.meta %>%
+    dplyr::group_by(chr) %>%
+    dplyr::mutate(bin = floor(start / bin_size)) %>%
+    dplyr::ungroup()
+  
+  if (is.null(ok_clones)) {
+      ok_clones <- base::unique(cn$clone)
+  }
+  
+  G <- length(sce)
+  C <- ncol(sce)
+  gene_cn <- matrix(nrow = G, ncol = C)
+  for (c in 1:C) {
+    cell_name <- colnames(sce)[c]
+    cln <- cell2node$clone[c]
+    if (cln %in% ok_clones) {
+      cn.bin.clone <- cn.bin %>%
+        dplyr::filter(clone == cln) %>%
+        distinct(chr, bin, .keep_all = TRUE)
+      g_cn <- left_join(bin_sce, cn.bin.clone, by = c("chr", "bin")) %>%
+        fill(copy_number) %>%
+        dplyr::pull(copy_number)
+      gene_cn[, c] <- g_cn
+    }
+  }
+    
+  rowData(sce)$cn <- gene_cn
+  return(sce)
+}
+
+plot_cn_expr <- function(sce, ylim = c(0, +Inf)) {
+  all_cn.df <- as.data.frame(rowData(sce)$cn)
+  
+  avail_cells <- colSums(is.na(all_cn.df)) < nrow(all_cn.df)
+
+  cn.df <- as.data.frame(all_cn.df[,avail_cells]) # select only available cells
+  expr.df <- as.data.frame(logcounts(sce)[,avail_cells])
+  df <- as.data.frame(cbind(gather(expr.df)$value, gather(cn.df)$value))
+  colnames(df) <- c("count", "copy_number")
+  
+  saturate_cn <- function(cn) {
+    cn_class <- factor("1", levels = c(as.character(1:4), "5+"))
+    if (cn < 5) {
+      cn_class <- as.character(cn)
+    } else {
+      cn_class <- "5+"
+    }
+    return(cn_class)
+  }
+  df$cn_class <- sapply(df$copy_number, saturate_cn)
+
+  p <- df %>%
+    dplyr::filter(count > ylim[1] & count < ylim[2] & !is.na(copy_number) & copy_number > 0) %>%
+    ggplot() +
+      geom_boxplot(aes(x = cn_class, y = count, fill = cn_class), outlier.shape = NA) +
+      labs(x = "Copy number",
+           y = "Log gene expression") +
+    scale_fill_manual(values= c("#95c5e0", "#cccccc", "#f1a57e", "#d15f48", "#64021d")) +
+    theme(legend.position = "none")
+  
+  return(p)
+}
+```
+
+```{r read-synth, include = FALSE}
+syn.input_path <- file.path("/home/zemp/kth/thesis/_output/simul/")
+# single cell expression data
+syn.sc.mat <- read.csv(file.path(syn.input_path, "simul_fc.txt"), sep = '\t', header = TRUE) %>%
+  dplyr::select_if(~ !any(is.na(.))) %>%
+  as.matrix()
+
+# copy number data
+syn.cn <- read_csv(file.path(syn.input_path, "simul_clonal_cn.txt"), col_types = cols(
+                    clone_id = col_character(),
+                    chr = col_character(),
+                    start = col_double(),
+                    end = col_double(),
+                    total_cn = col_double()
+                  )) %>%
+  dplyr::select(chr, start, end, copy_number = total_cn, clone = clone_id) %>%
+  dplyr::mutate(chr = paste0('chr', chr))
+
+# mapping cell to node
+syn.c2n <- preprocess_c2n(read_tsv(file.path(syn.input_path, "cell2node.txt"),
+                              col_names = c("cell", "node")),
+                            recode = FALSE)
+chr.levels <- paste0("chr", c(as.character(1:22), c("X", "Y")))
+```
+
+```{r read-real, include=FALSE}
+sc.mat <- as.matrix(read.csv('/home/zemp/kth/thesis/data/HGSOC_fc.txt', sep = ' ', header = TRUE))
+cn <- read_csv('/home/zemp/kth/thesis/data/laks/ov2295_clone_cn.csv', col_types = cols(
+                  clone_id = col_character(),
+                  chr = col_character(),
+                  start = col_double(),
+                  end = col_double(),
+                  copy = col_double(),
+                  total_cn = col_double(),
+                  minor_cn = col_double(),
+                  major_cn = col_double()
+                )) %>%
+  dplyr::select(chr, start, end, copy_number = total_cn, clone = clone_id) %>%
+  dplyr::mutate(chr = paste0('chr', chr))
+
+c2n <- preprocess_c2n(read_tsv('/home/zemp/kth/thesis/data/HGSOC_results/cell2node.tsv',
+                                        col_names = c("cell", "node"), skip = 1),
+                                      recode = TRUE)
+```
+
+```{r annotate-sce, include=FALSE}
+# annotation with biomaRt
+ensembl <- useMart("ensembl")
+ensembl <- useDataset("hsapiens_gene_ensembl", mart = ensembl)
+
+# real
+sce.tot <- build_sce(sc.mat, ensembl)
+
+# syn
+syn.sce.tot <- build_sce(syn.sc.mat, ensembl)
+```
+
+## Gene filtering - real
+
+Remove genes for which the average count across all the cells is below a certain
+threshold (e.g. $0.2$)
+
+*Real data*
+
+```{r filter-genes}
+avg_count_thresh = 0.2
+
+# real
+sce <- filter_sce(sce.tot, avg_count_thresh, TRUE)
+
+```
+
+## Gene filtering - syn
+
+Filtering here isn't really important since the data is generated in order to
+have only expressed genes. This is to show that the distribution of the resulting
+filtered gene expression is similar.
+
+*Synthetic data*
+
+```{r gene_filtering-syn}
+# syn
+syn.sce <- filter_sce(syn.sce.tot, avg_count_thresh, TRUE)
+```
+
+```{r normalization}
+# real
+sce <- logNormCounts(sce)
+
+# syn
+syn.sce <- logNormCounts(syn.sce)
+```
+
+## Genes per chromosome - real
+
+Barplot showing the number of genes per chromosomes
+
+*Real dataset*
+
+```{r find-bin-width-real}
+gene_window = 25
+# real
+gen_res <- compute_genomic_res(sce, gene_window)
+paste0("Estimated bin width for real dataset: ", gen_res)
+```
+## Genes per chromosome - syn
+
+*Synthetic dataset*
+
+```{r find-bin-width-syn}
+# syn
+syn.gen_res <- compute_genomic_res(syn.sce, gene_window)
+
+paste0("Estimated bin width for synthetic dataset: ", syn.gen_res)
+
+paste0("taking the median neighboring genes distance and multiply it by ", gene_window," (gene window)")
+```
+
+```{r group-genes, include=FALSE}
+# binsize equal to the copy number data resolution
+
+bin_sce <- bin_sce_data(sce, gen_res)
+syn.bin_sce <- bin_sce_data(syn.sce, syn.gen_res)
+```
+
+## Plot gene expression/clone - real
+
+*Real dataset*
+
+```{r plot-real-chr-clone}
+c = 'chr20'
+cln = 'C'
+
+plot_chr_clone(bin_sce, cn, c2n,
+               chromosome = c, node = cln, bin_size = gen_res)
+
+```
+
+## Plot gene expression/clone - syn
+
+*Synthetic dataset*
+
+Copy numbers are more scattered. Copy number is evolved on each bin 
+independently one from the other, this results in less constant and more
+discontinuous jumps. However the gene expression variability seems to be close 
+to the real data 
+
+```{r plot-syn-chr-clone}
+c = 'chr20'
+cln = '0_0_2'
+
+plot_chr_clone(syn.bin_sce, syn.cn, syn.c2n,
+               chromosome = c, node = cln, bin_size = syn.gen_res)
+
+```
+
+## Full genome CN - real
+
+Looking at the copy number on the whole genome.
+
+*Real Data*
+
+```{r full-genome-plot, dpi=200, fig.width=10, fig.height=2}
+plot_genome_cn(sce, cn, "C")
+```
+
+## Full genome CN - syn
+
+Here the effect is even more visible.
+
+*Synthetic Data*
+
+```{r full-genome-plot-syn, dpi=200, fig.width=10, fig.height=2}
+plot_genome_cn(syn.sce, syn.cn, "0_0")
+```
+
+```{r plot-log-EF, eval = FALSE}
+c = 'chr5'
+cln = 'EF'
+
+bin_sce %>%
+  dplyr::filter(chr == c) %>%
+  pivot_longer(cols = grep('c\\d+', colnames(bin_sce), value = TRUE), names_to = "cell", values_to = "count") %>%
+  left_join(c2n.raw, by = "cell") %>%
+  dplyr::filter(clone == cln, count > 0) %>%
+  dplyr::mutate(logcount = log(count), pos = bin * bin_size + bin_size/2) %>%
+  ggplot() +
+    geom_boxplot(mapping = aes(x = pos, y = logcount, color = 'log-expr', group = pos)) +
+    geom_linerange(data = dplyr::filter(cn.raw, clone %in% unlist(str_split(cln, pattern = '')), chr == c),
+                   mapping = aes(xmin = start, xmax = end, y = copy_number, color = 'copy-num')) +
+    scale_colour_manual("",
+                        values = c("log-expr"="black", "copy-num"="red")) +
+    labs(title = paste0("Expression/copy-number - ", c), y = 'Log-count', x = 'Genomic position') +
+    scale_y_continuous(breaks = breaks_width(1))
+
+# TODO fix legend symbols: https://stackoverflow.com/questions/26587940/ggplot2-different-legend-symbols-for-points-and-lines
+```
+
+## Breakpoint sampling approach
+
+
+```{r bp-length-real}
+plot_breakpoint_lengths(cn, xlim = c(0, 500))
+```
+
+```{r bp-length-syn}
+plot_breakpoint_lengths(dplyr::filter(syn.cn, clone != "0"), xlim = c(0, 500))
+```
+
+## Copy number and expression
+
+```{r plot-cn-expr-depend, fig.width=4, fig.height=8}
+sce <- add_cn_to_sce(sce, cn, c2n)
+
+plot_cn_expr(sce, ylim = c(0, 60))
+```
+
+```{r syn-plot-cn-expr}
+syn.sce <- add_cn_to_sce(syn.sce, syn.cn, syn.c2n)
+
+# TODO retry with normalized model
+plot_cn_expr(syn.sce)
+```
+
+## Size factor
+
+```{r plot-size-factor}
+plot_sf(sce, bins = 150)
+```
+``` {r find-sf-library-ratio}
+lib_size <- colSums(counts(sce))
+
+sf <- colData(sce)$sizeFactor
+ratio <- lib_size / sf
+cat("Lib size / sf ratio mean: ", mean(ratio), ", var: ", var(ratio))
+```
+
+
+```{r plot-size-factor}
+plot_sf(syn.sce, 150)
+```

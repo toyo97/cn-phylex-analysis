@@ -1,0 +1,234 @@
+---
+title: "HSGOC EDA"
+author: Vittorio Zampinetti
+date: March 1, 2021
+output: 
+  ioslides_presentation:
+    widescreen: true
+    smaller: true
+    logo: /home/zemp/kth/thesis/R/img/kth_logo.svg
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(glue)
+library(ggfortify)
+suppressPackageStartupMessages(library('GenomicFeatures'))
+library(TxDb.Hsapiens.UCSC.hg19.knownGene)  # for location of genes
+library(org.Hs.eg.db)  # for entrezgene-ensembl mapping
+library(scales)
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+## Analyzed data
+
+```{r read-files, include=FALSE}
+cnv_mat <- readRDS('/home/zemp/kth/thesis/data/cnv_mat.rds')
+sc_expr_mat <- readRDS('/home/zemp/kth/thesis/data/sc_expr_mat.rds')
+sc_expr_mat_id <- data.frame(ensembl_id = row.names(sc_expr_mat), sc_expr_mat)
+cal <- readRDS('/home/zemp/kth/thesis/data/cal_ca_res.rds')
+ca <- readRDS('/home/zemp/kth/thesis/data/ca_data.rds')
+```
+
+- gene expression for single-cell RNA data
+- clone-specific copy numbers for each gene
+
+The two files are merged after unifying the genes ID convention (from Ensembl to GeneID)
+
+```{r merge-files, include=FALSE}
+entrezgene_ensembl_map <- as.data.frame(org.Hs.egENSEMBL)
+pos_Y <- merge(entrezgene_ensembl_map, sc_expr_mat_id, by = "ensembl_id")
+
+# now join the entrez_gene with the genome database
+txdb <- TxDb.Hsapiens.UCSC.hg19.knownGene
+cols <- c("TXCHROM", "TXSTART", "TXEND")
+entrez_pos_map <- AnnotationDbi::select(txdb, keys=pos_Y[["gene_id"]], columns=cols, keytype="GENEID")
+entrez_pos_map <- entrez_pos_map[!duplicated(entrez_pos_map[["GENEID"]]),]
+pos_map <- merge(entrezgene_ensembl_map, entrez_pos_map, by.x = "gene_id", by.y = "GENEID") %>%
+  dplyr::rename(chr = TXCHROM, start = TXSTART, end = TXEND) %>%
+  dplyr::mutate(chr = as.numeric(str_remove(chr, "chr"))) %>%
+  drop_na()
+
+Y <- merge(pos_Y, entrez_pos_map, by.x = "gene_id", by.y = "GENEID") %>%
+  dplyr::rename(chr = TXCHROM, start = TXSTART, end = TXEND) %>%
+  dplyr::select(-ensembl_id)
+idx_cols = c("gene_id", "chr", "start", "end")
+```
+```{r summary-genes, include=TRUE}
+message(glue("The total number of genes is {nrow(Y)}, with {sum(rowSums(dplyr::select(Y,-all_of(idx_cols))) > 0)} expressed genes"))
+```
+
+## Gene expression
+Shows the first 20 most expressed genes (whose total expression is highest).
+
+```{r top20, include=TRUE, warning=FALSE}
+# sort the expression and visualize the most expressed genes (total expression)
+Y %>%
+  dplyr::select(-c("chr", "start", "end")) %>%
+  dplyr::mutate(tot_expr = rowSums(across(where(is.numeric)))) %>%
+  dplyr::top_n(20, wt = tot_expr) %>%
+  pivot_longer(-c("gene_id", "tot_expr"), names_to = "cell", values_to = "value") %>%
+  ggplot() +
+    geom_boxplot(mapping = aes(x = fct_reorder(gene_id, value, .desc = TRUE), y = value),
+                 outlier.shape = NA,
+                 notch = TRUE) +
+    ylim(0, 2500) +
+    coord_flip() +
+    xlab("geneID") +
+    ylab("gene expression")
+```
+
+<!-- ## Log-tot-expr -->
+
+<!-- ```{r echo=FALSE} -->
+<!-- Y %>% -->
+<!--   dplyr::select(-c("chr", "start", "end")) %>% -->
+<!--   dplyr::mutate(tot_expr = rowSums(across(where(is.numeric)))) %>% -->
+<!--   dplyr::filter(tot_expr > 0) %>% -->
+<!--   dplyr::select(gene_id, tot_expr) %>% -->
+<!--   ggplot(mapping = aes(x = fct_reorder(gene_id, tot_expr, .desc = TRUE), y = log(tot_expr))) + -->
+<!--     geom_point() + -->
+<!--     labs(x = "genes", y = "log-total-expr") + -->
+<!--     theme(axis.ticks.x = element_blank(), -->
+<!--           axis.text.x = element_blank()) -->
+
+<!-- ## FIXME add grid -->
+<!-- ``` -->
+
+## PCA
+
+Performed on log-transformed expression after selecting a subset of genes.
+```{r pca, include=TRUE}
+n_cells <- ncol(sc_expr_mat)
+
+expr.pca <- log(1 + sc_expr_mat) %>%
+  as.data.frame() %>%
+  dplyr::filter(rowSums(. > 0) > (n_cells * 0.1)) %>%
+  t() %>%
+  prcomp(center = TRUE, scale. = TRUE)
+
+autoplot(expr.pca)
+
+message(glue("Genes with non-zero expression in less than 10% of the cells are filtered out
+             The number of retained genes is {length(expr.pca$center)}"))
+```
+
+## Clonealign results - unsuccessful
+
+$$
+cor(x, y)
+$$
+where $x$ is the copy number of a gene in a clone and $y$ the expression of the gene for cells in that clone. 
+
+```{r correlation-ca, include=TRUE}
+# analyze the result
+# (i) correlation boxplot
+
+corr_df <- data.frame(correlation = cal$correlations)
+
+corr_df %>%
+  ggplot(aes(x = correlation)) +
+  geom_histogram(aes(y = ..density..), binwidth = 0.01, alpha = 0.7) +
+  geom_density(color = 'red') +
+  geom_vline(xintercept = 0, linetype = "dashed")
+```
+
+## Cell assignments to clones
+
+```{r ca-barplot, warning=FALSE}
+cell_ass <- data.frame(clone = cal$clone, cell=ca$retained_cells)
+
+cell_ass %>%
+  ggplot(aes(x = clone)) +
+  geom_histogram(stat = "count") +
+  geom_text(aes(label = ..count..), stat = "count", vjust = -0.5)
+
+```
+
+## Copy numbers
+Copy numbers for each clone from A to I. Three main copy number profiles over 9 clones.
+(A, B, C, D), (E, F), (G, H, I)
+
+```{r cn-freq}
+cnv_mat %>% 
+  as.data.frame(ensembl_id = row.names(cnv_mat)) %>%
+  pivot_longer(cols = LETTERS[1:9], names_to = "clone", values_to = "copy_number") %>%
+    ggplot() +
+    geom_freqpoly(mapping = aes(x = copy_number, color = clone), binwidth = 1) +
+    scale_color_brewer(palette="Paired") +
+    scale_x_continuous(breaks = breaks_width(1))
+```
+
+## Copy number per chromosome pos*
+
+```{r cnv-sub, include=FALSE}
+genes_subs <- sc_expr_mat %>%
+  as.data.frame() %>%
+  dplyr::filter(rowSums(. > 0) > (n_cells * 0.1)) %>%
+  row.names()
+
+gene_ids_subs <- data.frame(ensembl_id = genes_subs)
+
+cnv_sub <- cnv_mat %>%
+  data.frame(ensembl_id = rownames(cnv_mat)) %>%
+  merge(gene_ids_subs) %>%
+  merge(pos_map) %>%
+  pivot_longer(cols = LETTERS[1:9], names_to = "clone", values_to = "copy_number") %>%
+  pivot_longer(cols = c("start", "end"), names_to = "extr", values_to = "pos") %>%
+  dplyr::mutate(pos = as.integer(pos), copy_number = as.integer(copy_number))
+
+```
+
+```{r chr-plots1, fig.width=10, fig.height=6}
+integer_breaks <- function(x)
+  seq(floor(min(x)), ceiling(max(x)))
+
+# plot cn for chr 1
+cnv_sub %>% dplyr::filter(chr <= 11) %>%
+  ggplot() +
+  geom_line(aes(x = pos, y = copy_number, color = clone)) +
+  facet_wrap(~ chr, ncol = 4, scales = "free") +
+  scale_y_continuous(breaks = integer_breaks) +
+  scale_x_continuous(breaks = pretty_breaks(n = 3))
+```   
+
+## Contd'
+
+```{r chr-plot2, fig.width=10, fig.height=6}
+cnv_sub %>% dplyr::filter(chr > 11) %>%
+  ggplot() +
+  geom_line(aes(x = pos, y = copy_number, color = clone)) +
+  facet_wrap(~ chr, ncol = 4, scales = "free") +
+  scale_y_continuous(breaks = integer_breaks) +
+  scale_x_continuous(breaks = pretty_breaks(n = 3))
+```
+<!-- ## Clonealign copy numbers -->
+
+<!-- ```{r} -->
+<!-- # suppressPackageStartupMessages(library(clonealign)) -->
+<!-- # library(SingleCellExperiment) -->
+<!-- # sce <- SingleCellExperiment(sc_expr_ret) -->
+<!-- #  -->
+<!-- # cnv_pos <- merge(data.frame(ensembl_id = rownames(cnv_mat), cnv_mat), entrezgene_ensembl_map, by = "ensembl_id") %>% -->
+<!-- #   merge(y = entrez_pos_map, by.x = "gene_id", by.y = "GENEID") %>% -->
+<!-- #   dplyr::filter(ensembl_id %in% rownames(sc_expr_ret)) %>% -->
+<!-- #   drop_na() %>% -->
+<!-- #   dplyr::distinct(ensembl_id, .keep_all = TRUE) %>% -->
+<!-- #   dplyr::select(chr = TXCHROM, start_pos = TXSTART, end_pos = TXEND, A:H) %>% -->
+<!-- #   dplyr::mutate(chr = str_remove(chr, "chr")) -->
+<!-- #  -->
+<!-- # rowData(sce) <- cnv_pos -->
+<!-- ``` -->
+<!-- ```{r} -->
+<!-- # plot_clonealign(sce, cal$clone, cnv_mat, -->
+<!-- #                 chromosome = "1", -->
+<!-- #                 chr_str = "chr", -->
+<!-- #                 start_str = "start_pos", -->
+<!-- #                 end_str = "end_pos") -->
+<!-- ``` -->
+
+## Session information
+
+```{r session}
+sessionInfo()
+```

@@ -1,0 +1,112 @@
+---
+title: "sc-RNA synthetic data"
+author: "Vittorio Zampinetti"
+date: "May 5, 2021"
+output: 
+  ioslides_presentation:
+    widescreen: true
+    smaller: true
+    logo: /home/zemp/kth/thesis/R/img/kth_logo.svg
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE)
+```
+
+```{r lib, include=FALSE}
+library(tidyverse)
+library(ggpubr)
+```
+
+```{r functions}
+read_data <- function(models) {
+  data <- list(poisson = list(), neg_binom = list(), zip = list(), zinb = list())
+  for (m in models) {
+    input_path <- file.path("data", "sens", "norm", m)
+    cn_var <- scan(file.path(input_path, "cn_variations.txt"), what="", sep="\n") %>%
+            strsplit(",")
+    # extract the first vector element and set it as the list element name
+    names(cn_var) <- sapply(cn_var, `[[`, 1)
+    # remove the first vector element from each list element
+    cn_var <- lapply(cn_var, function(x) as.numeric(unlist(x[-1])))
+    cn_var <- cn_var[-1]
+    data[[m]]$cn_var <- cn_var
+    
+    true_cn <- scan(file.path(input_path, "true_cn.txt"), what="", sep="\n") %>%
+            strsplit(",")
+    names(true_cn) <- sapply(true_cn, `[[`, 1)
+    true_cn <- lapply(true_cn, function(x) as.numeric(unlist(x[-1])))
+    true_cn <- true_cn[-1]
+    data[[m]]$true_cn <- true_cn
+    
+    data[[m]]$loglikelihoods <- read_csv(file.path(input_path, "var_loglik.txt"), 
+                             col_names = c("loglik"))
+    data[[m]]$true_loglik <- read_csv(file.path(input_path, "true_loglik.txt"), 
+                               col_names = c("loglik"))
+  }
+  return(data)
+}
+
+plot_sens_analysis <- function(model_data) {
+  # compute distances between true and variation for the same clone
+  distances <- sapply(seq_along(model_data$cn_var),
+             function(ind, list, names, gt) {
+               x1 <- list[[ind]]
+               x2 <- gt[[names[ind]]]
+               return(sqrt(sum((x1 - x2) ^ 2)))
+             },
+             list = model_data$cn_var, names = names(model_data$cn_var), gt = model_data$true_cn)
+
+  # plot the distances vs likelihood
+  p <- ggplot() +
+        geom_point(mapping = aes(x = distances, y = model_data$loglikelihoods[[1]], color = names(model_data$cn_var))) +
+        geom_hline(mapping = aes(yintercept = model_data$true_loglik[[1]], color = "True CN"),
+                   linetype = "dashed", alpha = 0.7) +
+        scale_y_reverse() +
+        labs(x = "cn distance",
+             y = "log-likelihood",
+             color = "clone")
+  return(p)
+}
+
+plot_cn_dist <- function(model_data) {
+  h <- lapply(data$poisson$true_cn, function(x) hist(x, breaks = seq(-0.5, 6.5, by = 1), plot = FALSE)$counts)
+  h <- rownames_to_column(setNames(as.data.frame(do.call(rbind, h)), 0:6), "clone")
+  h.df.long <- pivot_longer(h, cols = sapply(0:6, as.character), names_to = "value", values_to = "count")
+  # plot the histogram
+  p <- ggplot(h.df.long, aes(x = value, y = count, fill = clone)) +
+        geom_bar(stat = "identity")
+  return(p)
+}
+```
+
+```{r read-data, include=FALSE}
+models = c("A" = "poisson",
+           "B" = "neg_binom",
+           "C" = "zip",
+           "D" = "zinb")
+
+data <- read_data(models)
+```
+
+```{r sens-an-plots}
+
+figure <- ggarrange(plot_sens_analysis(data[[models[1]]]),
+                    plot_sens_analysis(data[[models[2]]]),
+                    plot_sens_analysis(data[[models[3]]]),
+                    plot_sens_analysis(data[[models[4]]]),
+                    labels = names(models),
+                    ncol = 2, nrow = 2, common.legend = T)
+figure
+```
+
+```{r cn-dist-plot}
+
+figure <- ggarrange(plot_cn_dist(data[[models[1]]]),
+                    plot_cn_dist(data[[models[2]]]),
+                    plot_cn_dist(data[[models[3]]]),
+                    plot_cn_dist(data[[models[4]]]),
+                    labels = names(models),
+                    ncol = 2, nrow = 2, common.legend = T)
+figure
+```

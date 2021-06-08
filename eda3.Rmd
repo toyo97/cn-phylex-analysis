@@ -1,0 +1,236 @@
+---
+title: "sc-RNA analysis"
+author: "Vittorio Zampinetti"
+date: "March 15, 2021"
+output: 
+  ioslides_presentation:
+    widescreen: true
+    smaller: true
+    logo: /home/zemp/kth/thesis/R/img/kth_logo.svg
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+new_slide <- function(title = 'Next') {
+  knitr::asis_output(paste0('\n\n## ', title, '\n\n'))
+}
+```
+
+```{r lib, include=FALSE}
+library(tidyverse)
+library(scales)
+
+library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+library(org.Hs.eg.db)
+library(biomaRt)
+
+library(SingleCellExperiment)
+library(scran)
+library(scater)
+```
+
+```{r read-raw, include=FALSE}
+sc.mat.raw <- as.matrix(read.csv('/home/zemp/kth/thesis/data/HGSOC_fc.txt', sep = ' ', header = TRUE))
+sc.raw <- as_tibble(sc.mat.raw, rownames = 'ensembl_id')
+cn.raw <- read_csv('/home/zemp/kth/thesis/data/laks/ov2295_clone_cn.csv', col_types = cols(
+  clone_id = col_character(),
+  chr = col_character(),
+  start = col_double(),
+  end = col_double(),
+  copy = col_double(),
+  total_cn = col_double(),
+  minor_cn = col_double(),
+  major_cn = col_double()
+))
+c2n.raw <- read_tsv('/home/zemp/kth/thesis/data/HGSOC_results/cell2node.tsv',
+                    col_names = c("cell", "node"), skip = 1)
+
+chr.levels <- paste0("chr", c(as.character(1:22), c("X", "Y", "MT")))
+```
+
+```{r overlap-cn, include=FALSE}
+cn.raw <- cn.raw %>%
+  dplyr::select(chr, start, end, copy_number = total_cn, clone = clone_id) %>%
+  dplyr::mutate(chr = paste0('chr', chr))
+
+cn.coords <-makeGRangesFromDataFrame(cn.raw, keep.extra.columns = TRUE)
+
+gene2ensembl <- as.data.frame(org.Hs.egENSEMBL)
+
+g <- genes(TxDb.Hsapiens.UCSC.hg19.knownGene, single.strand.genes.only=FALSE)
+
+# overlaps between the gene annotation and the copy number data
+olaps <- findOverlaps(g, cn.coords)
+
+# create the joint dataframe which contains clone specific copy numbers, ranges and ensembl IDs
+cn <- data.frame(gene_id = names(g)[queryHits(olaps)],
+                      copy_number = mcols(cn.coords)$copy_number[subjectHits(olaps)],
+                      clone = mcols(cn.coords)$clone[subjectHits(olaps)],
+                      chr = factor(as.vector(seqnames(cn.coords))[subjectHits(olaps)], levels = chr.levels),
+                      start = start(ranges(cn.coords))[subjectHits(olaps)],
+                      end = end(ranges(cn.coords))[subjectHits(olaps)]) %>%
+  merge(gene2ensembl) %>%
+  drop_na()
+
+ensembl2pos <- cn %>%
+  dplyr::select(ensembl_id, chr, start, end) %>%
+  dplyr::distinct()
+```
+
+```{r fix-df, include=FALSE}
+# fix the values of the column for nodes assignment
+c2n.raw <- c2n.raw %>%
+  dplyr::mutate(clone = recode(node,
+                               '0_0' = 'ABCDEFGHI',
+                               '0_0_0' = 'ABCD',
+                               '0_0_0_0' = 'CD',
+                               '0_0_0_0_0'= 'C',
+                               '0_0_1' = 'EFGHI',
+                               '0_0_0_1' = 'EF'))
+sce.tot <- SingleCellExperiment(assays = list(counts = sc.mat.raw))
+```
+
+```{r annotate-sce, include=FALSE}
+# with biomaRt
+ensembl <- useMart("ensembl")
+ensembl <- useDataset("hsapiens_gene_ensembl", mart = ensembl)
+
+ensembl2pos <- getBM(attributes=c('ensembl_gene_id', 'chromosome_name', 'start_position', 'end_position'), 
+      filters = 'ensembl_gene_id', 
+      values = rownames(sce.tot), 
+      mart = ensembl)
+
+keep <- rownames(sce.tot) %in% ensembl2pos$ensembl_gene_id
+sce.tot <- sce.tot[keep,]
+# map rownames to location coordinates
+ensembl2pos.sorted <- left_join(tibble(ensembl_gene_id = rownames(sce.tot)), ensembl2pos)
+# add location to metadata of sce
+rowData(sce.tot)$chromosome_name <- factor(paste0('chr', ensembl2pos.sorted$chromosome_name), levels = chr.levels)
+rowData(sce.tot)$start_position <- ensembl2pos.sorted$start_position
+rowData(sce.tot)$end_position <- ensembl2pos.sorted$end_position
+```
+
+## Gene filtering
+
+```{r filter-genes}
+# keep only the expressed genes taking 0.2 avg count as a threshold
+avg.counts <- rowMeans(counts(sce.tot))
+keep <- avg.counts >= 0.2
+sce <- sce.tot[keep,]
+
+ggplot(as.data.frame(log(avg.counts))) +
+  geom_histogram(aes(log(avg.counts)), bins = 100) +
+  xlab('log-avg-count') +
+  geom_vline(xintercept = 0.2, linetype = 'dashed', color = 'blue')
+```
+
+```{r size-factor-form-deconv}
+clusters <- quickCluster(sce)
+sce <- computeSumFactors(sce, cluster=clusters)
+
+keep_cells <- colMeans(counts(sce)) >= 0.5
+
+ggplot() +
+  geom_point(aes(x=sizeFactors(sce[,keep_cells]), y=sce[, keep_cells]$total_counts/1e3), alpha=0.4) +
+  labs(x = "Size factor",
+       y = "Library size (thousands)") +
+  scale_x_continuous(trans="log10") +
+  scale_y_continuous(trans="log10")
+
+```
+
+```{r normalization}
+# sce <- calculateQCMetrics(sce)
+
+sce <- logNormCounts(sce)
+```
+
+```{r chroms-dataframe, include=FALSE}
+sce.meta <- tibble(
+  ensembl_id = rownames(sce),
+  chr = rowData(sce)$chromosome_name,
+  start = rowData(sce)$start_position,
+  end = rowData(sce)$end_position) %>%
+  dplyr::mutate(mid = (start + end) / 2) %>%
+  dplyr::arrange(chr, mid)
+```
+
+## Genes per chromosome
+
+```{r gene-per-chr-plot}
+sce.meta %>%
+  dplyr::mutate(chr.n = factor(str_remove(chr, 'chr'), levels = c(1:22, c('X', 'Y', 'MT')))) %>%
+  dplyr::filter(!(chr.n %in% c('Y', 'MT'))) %>%
+  ggplot(aes(x = chr.n)) +
+    geom_bar(fill = 'deepskyblue4')
+```
+```{r find-bin-width}
+# estimate bin width (genomic resolution) following copykat
+# take the median neighboring genes distance and multiply it by 25 (gene window)
+
+dist <- sce.meta %>%
+  dplyr::group_by(chr) %>%
+  dplyr::mutate(dist = mid - lag(mid, default = 0)) %>%
+  dplyr::ungroup() %>%
+  dplyr::pull(dist)
+
+gen_res <- median(dist) * 25
+paste0("Estimated bin width: ", gen_res)
+paste0("taking the median neighboring genes distance and multiply it by 25 (gene window)")
+```
+```{r group-genes, include=FALSE}
+# binsize equal to the copy number data resolution
+bin_size <- 5e6
+
+sce.df <- bind_cols(sce.meta, as_tibble(counts(sce)))
+
+bin_sce <- sce.df %>%
+  dplyr::arrange(chr, end) %>%
+  dplyr::group_by(chr) %>%
+  dplyr::mutate(bin = floor(end / bin_size)) %>%
+  dplyr::group_by(chr, bin) %>%
+  dplyr::summarise(dplyr::across(matches('c\\d+'), sum))
+```
+```{r plot-log-C}
+c = 'chr5'
+cln = 'C'
+
+bin_sce %>%
+  dplyr::filter(chr == c) %>%
+  pivot_longer(cols = grep('c\\d+', colnames(bin_sce), value = TRUE), names_to = "cell", values_to = "count") %>%
+  left_join(c2n.raw, by = "cell") %>%
+  dplyr::filter(clone == cln, count > 0) %>%
+  dplyr::mutate(logcount = log(count), pos = bin * bin_size + bin_size/2) %>%
+  ggplot() +
+    geom_boxplot(mapping = aes(x = pos, y = logcount, color = 'log-expr', group = pos)) +
+    geom_linerange(data = dplyr::filter(cn.raw, clone == cln, chr == c),
+                   mapping = aes(xmin = start, xmax = end, y = copy_number, color = 'copy-num')) +
+    scale_colour_manual("",
+                        values = c("log-expr"="black", "copy-num"="red")) +
+    labs(title = paste0("Expression/copy-number - ", c), y = 'Log-count', x = 'Genomic position') +
+    scale_y_continuous(breaks = breaks_width(1))
+
+# TODO fix legend symbols: https://stackoverflow.com/questions/26587940/ggplot2-different-legend-symbols-for-points-and-lines
+```
+
+```{r plot-log-EF}
+c = 'chr5'
+cln = 'EF'
+
+bin_sce %>%
+  dplyr::filter(chr == c) %>%
+  pivot_longer(cols = grep('c\\d+', colnames(bin_sce), value = TRUE), names_to = "cell", values_to = "count") %>%
+  left_join(c2n.raw, by = "cell") %>%
+  dplyr::filter(clone == cln, count > 0) %>%
+  dplyr::mutate(logcount = log(count), pos = bin * bin_size + bin_size/2) %>%
+  ggplot() +
+    geom_boxplot(mapping = aes(x = pos, y = logcount, color = 'log-expr', group = pos)) +
+    geom_linerange(data = dplyr::filter(cn.raw, clone %in% unlist(str_split(cln, pattern = '')), chr == c),
+                   mapping = aes(xmin = start, xmax = end, y = copy_number, color = 'copy-num')) +
+    scale_colour_manual("",
+                        values = c("log-expr"="black", "copy-num"="red")) +
+    labs(title = paste0("Expression/copy-number - ", c), y = 'Log-count', x = 'Genomic position') +
+    scale_y_continuous(breaks = breaks_width(1))
+
+# TODO fix legend symbols: https://stackoverflow.com/questions/26587940/ggplot2-different-legend-symbols-for-points-and-lines
+```
